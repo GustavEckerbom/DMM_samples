@@ -5,9 +5,7 @@ This script displays the TC-08 image and lets you click on each channel to recor
 exact pixel coordinates. Run this once to generate the correct channel_rects values.
 """
 
-from PySide6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
-from PySide6.QtGui import QPixmap, QMouseEvent
-from PySide6.QtCore import Qt
+from qt_compat import QApplication, QLabel, QVBoxLayout, QWidget, QPixmap, QMouseEvent, Qt
 
 
 class CalibrationWindow(QWidget):

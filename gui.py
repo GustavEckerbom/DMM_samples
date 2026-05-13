@@ -2,36 +2,7 @@ import os
 import math
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QThread, QTimer, Slot, QRect, QSize, QPoint
-from PySide6.QtWidgets import (
-    QApplication,
-    QCheckBox,
-    QColorDialog,
-    QComboBox,
-    QDialog,
-    QDialogButtonBox,
-    QFrame,
-    QGroupBox,
-    QGridLayout,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QMainWindow,
-    QMessageBox,
-    QPushButton,
-    QTabWidget,
-    QVBoxLayout,
-    QWidget,
-    QFileDialog,
-    QTextEdit,
-    QGraphicsView,
-    QGraphicsScene,
-    QGraphicsPixmapItem,
-    QGraphicsRectItem,
-)
-from PySide6.QtGui import QPixmap, QColor, QBrush, QPainterPath
-from PySide6.QtWidgets import QGraphicsItem, QSpinBox
-from PySide6.QtCore import QRectF
+from qt_compat import *
 
 import pyqtgraph as pg
 

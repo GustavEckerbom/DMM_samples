@@ -1,4 +1,4 @@
-﻿from PySide6.QtWidgets import QApplication
+﻿from qt_compat import QApplication
 import sys
 
 from gui import DmmLoggerWindow

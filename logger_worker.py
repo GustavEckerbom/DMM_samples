@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional
 
-from PySide6.QtCore import QObject, Signal, Slot
+from qt_compat import QObject, Signal, Slot
 
 from dmm_comm import DmmInstrument, make_csv_filename, INTER_QUERY_DELAY_S
 from pico_tc08_comm import Tc08Instrument
