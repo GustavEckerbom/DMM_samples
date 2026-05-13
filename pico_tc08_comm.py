@@ -34,6 +34,7 @@ from __future__ import annotations
 import ctypes
 import math
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -79,54 +80,72 @@ class Tc08Error(RuntimeError):
     pass
 
 
-def _default_dll_candidates() -> list[str]:
+def _default_tc08_library_candidates() -> list[str]:
     module_dir = Path(__file__).resolve().parent
-    candidates = [
-        str(module_dir / "usbtc08.dll"),
-        "usbtc08.dll",
-    ]
+    candidates: list[str] = []
 
-    program_files = [
-        os.environ.get("ProgramFiles"),
-        os.environ.get("ProgramFiles(x86)"),
-    ]
+    if sys.platform.startswith("win"):
+        candidates = [
+            str(module_dir / "usbtc08.dll"),
+            "usbtc08.dll",
+        ]
 
-    possible_subdirs = [
-        r"Pico Technology\SDK\lib\usbtc08.dll",
-        r"Pico Technology\PicoSDK\lib\usbtc08.dll",
-        r"Pico Technology\PicoLog 6\usbtc08.dll",
-    ]
+        program_files = [
+            os.environ.get("ProgramFiles"),
+            os.environ.get("ProgramFiles(x86)"),
+        ]
 
-    for root in program_files:
-        if not root:
-            continue
-        for subdir in possible_subdirs:
-            candidates.append(str(Path(root) / subdir))
+        possible_subdirs = [
+            r"Pico Technology\SDK\lib\usbtc08.dll",
+            r"Pico Technology\PicoSDK\lib\usbtc08.dll",
+            r"Pico Technology\PicoLog 6\usbtc08.dll",
+        ]
+
+        for root in program_files:
+            if not root:
+                continue
+            for subdir in possible_subdirs:
+                candidates.append(str(Path(root) / subdir))
+
+    elif sys.platform.startswith("linux"):
+        candidates = [
+            str(module_dir / "libusbtc08.so"),
+            "/opt/PicoLog/resources/libusbtc08.so",
+            "/usr/lib/libusbtc08.so",
+            "/usr/local/lib/libusbtc08.so",
+            "/usr/lib/arm-linux-gnueabihf/libusbtc08.so",
+            "/usr/lib/arm-linux-gnueabihf/libusbtc08.so.1",
+        ]
+    else:
+        raise Tc08Error(f"Unsupported platform: {sys.platform}")
 
     return candidates
 
 
-def _load_tc08_dll(dll_path: Optional[str] = None) -> ctypes.WinDLL:
-    def load_with_directory(candidate: str) -> ctypes.WinDLL:
+def _load_tc08_dll(dll_path: Optional[str] = None) -> ctypes.CDLL | ctypes.WinDLL:
+    def load_with_directory(candidate: str):
         candidate_path = Path(candidate)
-        if candidate_path.parent != Path(".") and hasattr(os, "add_dll_directory"):
-            _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(str(candidate_path.parent)))
-        return ctypes.WinDLL(str(candidate_path))
+        if candidate_path.parent != Path("."):
+            if sys.platform.startswith("win") and hasattr(os, "add_dll_directory"):
+                _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(str(candidate_path.parent)))
+        if sys.platform.startswith("win"):
+            return ctypes.WinDLL(str(candidate_path))
+        return ctypes.CDLL(str(candidate_path))
 
     if dll_path:
         return load_with_directory(dll_path)
 
     last_error: Optional[Exception] = None
-    for candidate in _default_dll_candidates():
+    for candidate in _default_tc08_library_candidates():
         try:
             return load_with_directory(candidate)
         except Exception as exc:
             last_error = exc
 
     raise Tc08Error(
-        "Could not load usbtc08.dll. Install PicoSDK/PicoLog, add the DLL directory "
-        "to PATH, copy the PicoSDK DLLs next to this app, or pass "
-        "dll_path='C:/path/to/usbtc08.dll'. "
+        "Could not load Pico TC-08 library. Install PicoSDK/PicoLog, add the library directory "
+        "to PATH/LD_LIBRARY_PATH, copy the library next to this app, or pass "
+        "dll_path='/path/to/usbtc08.dll' or dll_path='/path/to/libusbtc08.so'. "
         f"Last load error: {last_error}"
     )
 
