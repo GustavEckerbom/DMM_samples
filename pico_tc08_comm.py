@@ -46,6 +46,7 @@ TC08_UNITS_RANKINE = 3
 
 VALID_TC_TYPES = {"B", "E", "J", "K", "N", "R", "S", "T", "X", " "}
 VALID_CHANNELS = range(0, 9)
+_DLL_DIRECTORY_HANDLES = []
 
 # Values from the programmer's guide.
 TC08_ERROR_CODES = {
@@ -79,7 +80,11 @@ class Tc08Error(RuntimeError):
 
 
 def _default_dll_candidates() -> list[str]:
-    candidates = ["usbtc08.dll"]
+    module_dir = Path(__file__).resolve().parent
+    candidates = [
+        str(module_dir / "usbtc08.dll"),
+        "usbtc08.dll",
+    ]
 
     program_files = [
         os.environ.get("ProgramFiles"),
@@ -102,19 +107,26 @@ def _default_dll_candidates() -> list[str]:
 
 
 def _load_tc08_dll(dll_path: Optional[str] = None) -> ctypes.WinDLL:
+    def load_with_directory(candidate: str) -> ctypes.WinDLL:
+        candidate_path = Path(candidate)
+        if candidate_path.parent != Path(".") and hasattr(os, "add_dll_directory"):
+            _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(str(candidate_path.parent)))
+        return ctypes.WinDLL(str(candidate_path))
+
     if dll_path:
-        return ctypes.WinDLL(dll_path)
+        return load_with_directory(dll_path)
 
     last_error: Optional[Exception] = None
     for candidate in _default_dll_candidates():
         try:
-            return ctypes.WinDLL(candidate)
+            return load_with_directory(candidate)
         except Exception as exc:
             last_error = exc
 
     raise Tc08Error(
         "Could not load usbtc08.dll. Install PicoSDK/PicoLog, add the DLL directory "
-        "to PATH, or pass dll_path='C:/path/to/usbtc08.dll'. "
+        "to PATH, copy the PicoSDK DLLs next to this app, or pass "
+        "dll_path='C:/path/to/usbtc08.dll'. "
         f"Last load error: {last_error}"
     )
 

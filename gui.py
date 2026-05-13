@@ -1,10 +1,12 @@
 import os
+import math
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QThread, QTimer, Slot
+from PySide6.QtCore import Qt, QThread, QTimer, Slot, QRect, QSize, QPoint
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -22,7 +24,18 @@ from PySide6.QtWidgets import (
     QWidget,
     QFileDialog,
     QTextEdit,
+    QGraphicsView,
+    QGraphicsScene,
+    QGraphicsPixmapItem,
+    QGraphicsRectItem,
 )
+from PySide6.QtGui import QPixmap, QColor, QBrush, QPainterPath
+from PySide6.QtWidgets import QGraphicsItem, QSpinBox
+from PySide6.QtCore import QRectF
+
+import pyqtgraph as pg
+
+pg.setConfigOptions(antialias=True)
 
 from dmm_comm import (
     CURRENT_RANGES,
@@ -52,6 +65,170 @@ TC08_TYPES = [
     ("B", "B"),
 ]
 
+TC08_DISABLED_COLOR = "#8fcaf0"
+TC08_DEFAULT_ENABLED_COLOR = "#1a4b8d"
+
+
+class CircularBuffer:
+    """A fixed-size circular buffer for storing time-series data."""
+    
+    def __init__(self, max_size=100):
+        self.max_size = max_size
+        self.data = []
+        self.timestamps = []
+        self.write_pos = 0
+        
+    def append(self, value, timestamp):
+        """Add a value to the buffer."""
+        if len(self.data) < self.max_size:
+            self.data.append(value)
+            self.timestamps.append(timestamp)
+        else:
+            self.data[self.write_pos] = value
+            self.timestamps[self.write_pos] = timestamp
+            self.write_pos = (self.write_pos + 1) % self.max_size
+    
+    def get_data(self):
+        """Return (timestamps, values) in chronological order."""
+        if not self.data:
+            return [], []
+        
+        if len(self.data) < self.max_size:
+            return self.timestamps, self.data
+        
+        # Reorder to chronological order (write_pos is the oldest)
+        timestamps = self.timestamps[self.write_pos:] + self.timestamps[:self.write_pos]
+        data = self.data[self.write_pos:] + self.data[:self.write_pos]
+        return timestamps, data
+    
+    def clear(self):
+        """Clear the buffer."""
+        self.data = []
+        self.timestamps = []
+        self.write_pos = 0
+    
+    def set_max_size(self, new_size):
+        """Resize the buffer."""
+        self.max_size = new_size
+        if len(self.data) > new_size:
+            self.data = self.data[-new_size:]
+            self.timestamps = self.timestamps[-new_size:]
+        self.write_pos = 0
+
+
+class RoundedChannelButton(QGraphicsItem):
+    """A graphics item that displays a rounded rectangle with a channel number."""
+    
+    def __init__(self, channel, x, y, width, height, color=TC08_DISABLED_COLOR, parent=None):
+        super().__init__(parent)
+        self.channel = channel
+        self.rect = QRectF(x, y, width, height)
+        self.color = color  # Store the channel color
+        self.brush = QBrush(QColor(color))
+        self.corner_radius = 4
+        self.setAcceptHoverEvents(True)
+        
+    def boundingRect(self):
+        return self.rect
+    
+    def paint(self, painter, option, widget=None):
+        # Create rounded rectangle path
+        path = QPainterPath()
+        path.addRoundedRect(self.rect, self.corner_radius, self.corner_radius)
+        
+        # Draw the rounded rectangle
+        painter.fillPath(path, self.brush)
+        
+        # Draw text
+        painter.setPen(Qt.black)
+        font = painter.font()
+        font.setPointSize(8)
+        painter.setFont(font)
+        painter.drawText(self.rect.toRect(), Qt.AlignCenter, str(self.channel))
+    
+    def set_color(self, color_hex):
+        """Update the button color."""
+        self.color = color_hex
+        self.brush = QBrush(QColor(color_hex))
+        self.update()
+
+
+class TC08GraphicsView(QGraphicsView):
+    """Custom graphics view for TC-08 device image with clickable channels."""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.channel_items = {}  # Map channel -> RoundedChannelButton
+        self.on_channel_clicked = None
+        self.setStyleSheet("border: none; background-color: white;")
+        
+    def setup_image(self, image_path, parent_window):
+        """Load image and create clickable channel regions."""
+        scene = QGraphicsScene()
+        pixmap = QPixmap(image_path)
+        if pixmap.isNull():
+            print(f"Failed to load image: {image_path}")
+            return False
+        
+        self.pixmap_item = QGraphicsPixmapItem(pixmap)
+        scene.addItem(self.pixmap_item)
+        self.setScene(scene)
+        
+        # Define channel click regions (x, y, width, height)
+        # Calibrated from actual TC-08 image (141x242)
+        original_rects = {
+            1: QRect(31, 203, 45, 30),
+            2: QRect(25, 175, 45, 30),
+            3: QRect(25, 148, 45, 30),
+            4: QRect(31, 120, 45, 30),
+            5: QRect(67, 120, 45, 30),
+            6: QRect(73, 148, 45, 30),
+            7: QRect(73, 177, 45, 30),
+            8: QRect(67, 204, 45, 30),
+        }
+        
+        # Reduce size: 1/4 smaller in width, 1/6 smaller in height
+        # New width: 45 * 0.75 = 33.75 ≈ 34, new height: 30 * (5/6) ≈ 25
+        for channel, rect in original_rects.items():
+            new_width = int(rect.width() * 0.75)  # 1/4 smaller
+            new_height = int(rect.height() * 5 / 6)  # 1/6 smaller
+            dx = (rect.width() - new_width) // 2
+            dy = (rect.height() - new_height) // 2
+            
+            button = RoundedChannelButton(
+                channel,
+                rect.x() + dx,
+                rect.y() + dy,
+                new_width,
+                new_height,
+                color=TC08_DISABLED_COLOR
+            )
+            scene.addItem(button)
+            self.channel_items[channel] = button
+        
+        self.setSceneRect(scene.itemsBoundingRect())
+        return True
+    
+    def update_channel_state(self, channel_colors):
+        """Update button colors based on channel configuration.
+        
+        Args:
+            channel_colors: dict mapping channel number -> color hex string
+        """
+        for channel, button in self.channel_items.items():
+            if channel in channel_colors:
+                button.set_color(channel_colors[channel])
+    
+    def mousePressEvent(self, event):
+        """Handle mouse clicks on channels."""
+        scene_pos = self.mapToScene(event.pos())
+        
+        for channel, button in self.channel_items.items():
+            if button.rect.contains(scene_pos):
+                if self.on_channel_clicked:
+                    self.on_channel_clicked(channel - 1)  # Convert to 0-based index
+                break
+
 
 class DmmLoggerWindow(QMainWindow):
     def __init__(self) -> None:
@@ -72,12 +249,6 @@ class DmmLoggerWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
 
         controls_layout = QHBoxLayout()
-        self.dmm_count_combo = QComboBox()
-        self.dmm_count_combo.addItems(["1", "2", "3", "4"])
-        self.dmm_count_combo.currentIndexChanged.connect(self.on_dmm_count_changed)
-        controls_layout.addWidget(QLabel("DMMs:"))
-        controls_layout.addWidget(self.dmm_count_combo)
-
         self.detect_button = QPushButton("Detect DMMs")
         self.detect_button.clicked.connect(self.on_detect_dmm_clicked)
         controls_layout.addWidget(self.detect_button)
@@ -109,6 +280,16 @@ class DmmLoggerWindow(QMainWindow):
 
         dmm_tab = QWidget()
         dmm_tab_layout = QVBoxLayout(dmm_tab)
+        dmm_controls_layout = QHBoxLayout()
+        self.dmm_count_combo = QComboBox()
+        self.dmm_count_combo.addItems(["0", "1", "2", "3", "4"])
+        self.dmm_count_combo.setCurrentText("0")
+        self.dmm_count_combo.currentIndexChanged.connect(self.on_dmm_count_changed)
+        dmm_controls_layout.addWidget(QLabel("DMMs:"))
+        dmm_controls_layout.addWidget(self.dmm_count_combo)
+        dmm_controls_layout.addStretch()
+        dmm_tab_layout.addLayout(dmm_controls_layout)
+
         panel_grid = QGridLayout()
         self.dmm_panels = [self.create_dmm_panel(i + 1) for i in range(4)]
         for index, panel in enumerate(self.dmm_panels):
@@ -125,6 +306,13 @@ class DmmLoggerWindow(QMainWindow):
         self.update_tc08_summary()
         temp_tab_layout.addWidget(self.tc08_tab["widget"])
         self.tab_widget.addTab(temp_tab, "Temp")
+
+        plot_tab = QWidget()
+        plot_tab_layout = QVBoxLayout(plot_tab)
+        self.plot_tab = self.create_plot_tab()
+        self.plot_tab["sample_spinbox"].valueChanged.connect(self.on_plot_sample_count_changed)
+        plot_tab_layout.addWidget(self.plot_tab["widget"])
+        self.tab_widget.addTab(plot_tab, "Plot")
 
         main_layout.addWidget(self.tab_widget)
 
@@ -209,31 +397,25 @@ class DmmLoggerWindow(QMainWindow):
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
-        self.tc08_enable_checkbox = QCheckBox("Enable temperature logging")
-        self.tc08_enable_checkbox.setChecked(False)
-        self.tc08_enable_checkbox.stateChanged.connect(self.on_tc08_master_enabled_changed)
-        layout.addWidget(self.tc08_enable_checkbox)
+        # Create graphics view for TC-08 image
+        graphics_view = TC08GraphicsView()
+        graphics_view.setup_image("TC-08img.png", self)
+        graphics_view.on_channel_clicked = self.open_tc08_channel_dialog
+        graphics_view.setFixedHeight(350)
+        layout.addWidget(graphics_view)
 
-        channel_grid = QGridLayout()
-        channel_buttons: list[QPushButton] = []
         channel_configs: list[dict] = []
         for channel in range(1, 9):
-            button = QPushButton(str(channel))
-            button.setFixedSize(60, 60)
-            button.clicked.connect(lambda _, idx=channel - 1: self.open_tc08_channel_dialog(idx))
-            channel_grid.addWidget(button, (channel - 1) // 4, (channel - 1) % 4)
-            channel_buttons.append(button)
             channel_configs.append(
                 {
                     "channel": channel,
                     "enabled": False,
                     "tc_type": "K",
                     "label": f"TC08 CH{channel}",
+                    "color": TC08_DEFAULT_ENABLED_COLOR,
                     "last_temp": None,
                 }
             )
-
-        layout.addLayout(channel_grid)
 
         summary_label = QLabel("No TC-08 channels configured.")
         summary_label.setWordWrap(True)
@@ -241,10 +423,66 @@ class DmmLoggerWindow(QMainWindow):
 
         return {
             "widget": widget,
-            "buttons": channel_buttons,
+            "graphics_view": graphics_view,
             "configs": channel_configs,
             "summary": summary_label,
-            "enable_checkbox": self.tc08_enable_checkbox,
+        }
+
+    def create_plot_tab(self) -> dict:
+        """Create a tab with PyQtGraph plots for temperature and DMM data."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        # Control row
+        control_layout = QHBoxLayout()
+        control_layout.addWidget(QLabel("Plot samples:"))
+        sample_spinbox = QSpinBox()
+        sample_spinbox.setMinimum(10)
+        sample_spinbox.setMaximum(1000)
+        sample_spinbox.setValue(10)
+        sample_spinbox.setSingleStep(10)
+        control_layout.addWidget(sample_spinbox)
+        control_layout.addStretch()
+        layout.addLayout(control_layout)
+
+        # Create two plot widgets side-by-side
+        plot_container = QHBoxLayout()
+        
+        # Temperature plot
+        tc_plot = pg.PlotWidget(
+            title="Temperature Sensors",
+            axisItems={"bottom": pg.DateAxisItem(orientation="bottom")},
+        )
+        tc_plot.setBackground("w")
+        tc_plot.setLabel("left", "Temperature", units="°C")
+        tc_plot.setLabel("bottom", "Time")
+        tc_plot.addLegend()
+        tc_plot.showGrid(x=True, y=True, alpha=0.18)
+        plot_container.addWidget(tc_plot)
+        
+        # DMM plot
+        dmm_plot = pg.PlotWidget(
+            title="DMM Measurements",
+            axisItems={"bottom": pg.DateAxisItem(orientation="bottom")},
+        )
+        dmm_plot.setBackground("w")
+        dmm_plot.setLabel("left", "Measurement")
+        dmm_plot.setLabel("bottom", "Time")
+        dmm_plot.addLegend()
+        dmm_plot.showGrid(x=True, y=True, alpha=0.18)
+        plot_container.addWidget(dmm_plot)
+        
+        layout.addLayout(plot_container)
+        
+        return {
+            "widget": widget,
+            "tc_plot": tc_plot,
+            "dmm_plot": dmm_plot,
+            "sample_spinbox": sample_spinbox,
+            "tc_buffers": {},  # {channel: CircularBuffer}
+            "dmm_buffers": {},  # {dmm_index: CircularBuffer}
+            "tc_plot_items": {},  # {channel: PlotDataItem}
+            "dmm_plot_items": {},  # {dmm_index: PlotDataItem}
         }
 
     def open_tc08_channel_dialog(self, index: int) -> None:
@@ -273,6 +511,18 @@ class DmmLoggerWindow(QMainWindow):
         tc_type_row.addWidget(tc_type_combo)
         dialog_layout.addLayout(tc_type_row)
 
+        # Color picker
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("Color:"))
+        color_button = QPushButton()
+        color_button.setFixedWidth(80)
+        color_button.setProperty("selected_color", config["color"])
+        color_button.setStyleSheet(f"background-color: {config['color']};")
+        color_button.clicked.connect(lambda: self.pick_channel_color(color_button))
+        color_row.addWidget(color_button)
+        color_row.addStretch()
+        dialog_layout.addLayout(color_row)
+
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(dialog.accept)
         button_box.rejected.connect(dialog.reject)
@@ -284,31 +534,32 @@ class DmmLoggerWindow(QMainWindow):
         config["enabled"] = enabled_checkbox.isChecked()
         config["label"] = label_edit.text().strip() or f"TC08 CH{config['channel']}"
         config["tc_type"] = tc_type_combo.currentData()
+        config["color"] = color_button.property("selected_color") or TC08_DEFAULT_ENABLED_COLOR
         if not config["enabled"]:
             config["last_temp"] = None
 
         self.refresh_tc08_buttons()
         self.update_tc08_summary()
 
-    def refresh_tc08_buttons(self) -> None:
-        for index, button in enumerate(self.tc08_tab["buttons"]):
-            config = self.tc08_tab["configs"][index]
-            style = ""
-            if config["enabled"]:
-                style = (
-                    "background-color: #1a4b8d; color: white; border: 1px solid #183f73;"
-                )
-                button.setText(f"{config['channel']}\n{config['tc_type']}")
-                button.setToolTip(f"{config['label']} ({config['tc_type']})")
-            else:
-                style = (
-                    "background-color: #f0f0f0; color: black; border: 1px solid #999999;"
-                )
-                button.setText(str(config["channel"]))
-                button.setToolTip("Click to configure")
-            button.setStyleSheet(style)
+    def pick_channel_color(self, button: QPushButton) -> None:
+        """Open color picker dialog and update button color."""
+        current_color = QColor(button.property("selected_color") or TC08_DEFAULT_ENABLED_COLOR)
+        color = QColorDialog.getColor(current_color, self, "Pick Channel Color")
+        if color.isValid():
+            color_hex = color.name()
+            button.setProperty("selected_color", color_hex)
+            button.setStyleSheet(f"background-color: {color_hex};")
 
-        self.on_tc08_master_enabled_changed()
+    def refresh_tc08_buttons(self) -> None:
+        """Update the graphics view overlays based on channel colors."""
+        channel_colors = {}
+        for config in self.tc08_tab["configs"]:
+            channel_colors[config["channel"]] = (
+                config["color"] if config["enabled"] else TC08_DISABLED_COLOR
+            )
+        
+        self.tc08_tab["graphics_view"].update_channel_state(channel_colors)
+        self.update_tc08_summary()
 
     def update_tc08_summary(self) -> None:
         enabled_channels = [cfg for cfg in self.tc08_tab["configs"] if cfg["enabled"]]
@@ -322,13 +573,90 @@ class DmmLoggerWindow(QMainWindow):
                 f"{cfg['channel']}: {cfg['label']} ({cfg['tc_type']})"
             )
 
-        if not self.tc08_tab["enable_checkbox"].isChecked():
-            summary_lines.append("(Temperature logging is currently disabled.)")
-
         self.tc08_tab["summary"].setText("\n".join(summary_lines))
 
     def on_tc08_master_enabled_changed(self) -> None:
         self.update_tc08_summary()
+
+    def on_plot_sample_count_changed(self, new_count: int) -> None:
+        """Handle when user changes the plot sample count."""
+        for buffer in self.plot_tab["tc_buffers"].values():
+            buffer.set_max_size(new_count)
+        for buffer in self.plot_tab["dmm_buffers"].values():
+            buffer.set_max_size(new_count)
+        self.rescale_tc_plot_y_axis()
+
+    def rescale_tc_plot_y_axis(self) -> None:
+        """Scale the temperature plot across all enabled TC-08 channels."""
+        enabled_channels = {
+            config["channel"] for config in self.tc08_tab["configs"] if config["enabled"]
+        }
+        values = []
+        for channel, buffer in self.plot_tab["tc_buffers"].items():
+            if channel not in enabled_channels:
+                continue
+            _, temps = buffer.get_data()
+            values.extend(value for value in temps if not math.isnan(value))
+
+        if not values:
+            return
+
+        self.plot_tab["tc_plot"].setYRange(min(values) - 5, max(values) + 5, padding=0)
+
+    def update_tc_plot(self, channel: int, temp: float, timestamp: float) -> None:
+        """Update the temperature plot with new data."""
+        config = next((c for c in self.tc08_tab["configs"] if c["channel"] == channel), None)
+        label = config["label"] if config else f"TC08 CH{channel}"
+        color = config["color"] if config else TC08_DEFAULT_ENABLED_COLOR
+
+        if channel not in self.plot_tab["tc_buffers"]:
+            # First time seeing this channel
+            self.plot_tab["tc_buffers"][channel] = CircularBuffer(
+                self.plot_tab["sample_spinbox"].value()
+            )
+            pen = pg.mkPen(color, width=2)
+            plot_item = self.plot_tab["tc_plot"].plot(
+                name=label,
+                pen=pen,
+                connect="all",
+            )
+            self.plot_tab["tc_plot_items"][channel] = plot_item
+        else:
+            self.plot_tab["tc_plot_items"][channel].setPen(pg.mkPen(color, width=2))
+        
+        self.plot_tab["tc_buffers"][channel].append(temp, timestamp)
+        timestamps, temps = self.plot_tab["tc_buffers"][channel].get_data()
+        
+        if timestamps:
+            self.rescale_tc_plot_y_axis()
+            self.plot_tab["tc_plot_items"][channel].setData(timestamps, temps, connect="all")
+
+    def update_dmm_plot(self, dmm_index: int, value: float, timestamp: float, label: str) -> None:
+        """Update the DMM plot with new data."""
+        if dmm_index not in self.plot_tab["dmm_buffers"]:
+            # First time seeing this DMM
+            self.plot_tab["dmm_buffers"][dmm_index] = CircularBuffer(
+                self.plot_tab["sample_spinbox"].value()
+            )
+            pen = pg.mkPen(pg.intColor(dmm_index), width=2)
+            plot_item = self.plot_tab["dmm_plot"].plot(
+                name=label,
+                pen=pen,
+                connect="all",
+            )
+            self.plot_tab["dmm_plot_items"][dmm_index] = plot_item
+        
+        self.plot_tab["dmm_buffers"][dmm_index].append(value, timestamp)
+        timestamps, values = self.plot_tab["dmm_buffers"][dmm_index].get_data()
+        
+        if timestamps:
+            # Auto-scale Y axis with padding
+            min_val = min(values)
+            max_val = max(values)
+            padding = max((max_val - min_val) * 0.1, abs(max_val) * 0.2)  # 20% of max or 10%
+            self.plot_tab["dmm_plot"].setYRange(min_val - padding, max_val + padding)
+            
+            self.plot_tab["dmm_plot_items"][dmm_index].setData(timestamps, values, connect="all")
 
     def format_range_display(self, value: str, measurement_type: str) -> str:
         """Format range value for display with appropriate units."""
@@ -397,7 +725,7 @@ class DmmLoggerWindow(QMainWindow):
         self.populate_range_items(self.dmm_panels[index])
 
     def on_dmm_count_changed(self, index: int) -> None:
-        visible = index + 1
+        visible = int(self.dmm_count_combo.currentText())
         for i, panel in enumerate(self.dmm_panels):
             panel["group"].setVisible(i < visible)
 
@@ -444,6 +772,14 @@ class DmmLoggerWindow(QMainWindow):
         if self.worker_thread is not None:
             return
 
+        # Clear plot data
+        self.plot_tab["tc_buffers"].clear()
+        self.plot_tab["dmm_buffers"].clear()
+        self.plot_tab["tc_plot_items"].clear()
+        self.plot_tab["dmm_plot_items"].clear()
+        self.plot_tab["tc_plot"].clear()
+        self.plot_tab["dmm_plot"].clear()
+
         configs = []
         tc08_configs = []
         active_count = int(self.dmm_count_combo.currentText())
@@ -470,16 +806,24 @@ class DmmLoggerWindow(QMainWindow):
                 )
             )
 
-        if self.tc08_tab["enable_checkbox"].isChecked():
-            for channel_index, channel_config in enumerate(self.tc08_tab["configs"]):
-                if channel_config["enabled"]:
-                    tc08_configs.append(
-                        Tc08Config(
-                            label=channel_config["label"],
-                            channel=channel_config["channel"],
-                            tc_type=channel_config["tc_type"],
-                        )
+        # Collect enabled TC-08 channels (automatically enable if any channel is enabled)
+        for channel_index, channel_config in enumerate(self.tc08_tab["configs"]):
+            if channel_config["enabled"]:
+                tc08_configs.append(
+                    Tc08Config(
+                        label=channel_config["label"],
+                        channel=channel_config["channel"],
+                        tc_type=channel_config["tc_type"],
                     )
+                )
+
+        if not configs and not tc08_configs:
+            QMessageBox.warning(
+                self,
+                "Start Logging",
+                "Select at least one DMM or enable at least one TC-08 channel.",
+            )
+            return
 
         try:
             sample_period = float(self.sample_period_edit.text().strip())
@@ -539,14 +883,27 @@ class DmmLoggerWindow(QMainWindow):
                 self.format_reading_display(value, measurement_type, measurement_range)
             )
             self.flash_recording_indicator()
+            
+            # Update plot
+            label = panel["label"].text().strip() or f"DMM {index + 1}"
+            timestamp = datetime.now().timestamp()
+            self.update_dmm_plot(index, value, timestamp, label)
 
     @Slot(int, float)
-    def on_tc08_reading_updated(self, index: int, value: float) -> None:
-        if 0 <= index < len(self.tc08_tab["buttons"]):
-            button = self.tc08_tab["buttons"][index]
-            channel_config = self.tc08_tab["configs"][index]
-            button.setToolTip(f"{channel_config['label']}: {value:.3f} °C")
+    def on_tc08_reading_updated(self, channel: int, value: float) -> None:
+        channel_config = next(
+            (config for config in self.tc08_tab["configs"] if config["channel"] == channel),
+            None,
+        )
+        if channel_config is None:
+            return
+
+        channel_config["last_temp"] = value
         self.flash_recording_indicator()
+        
+        # Update plot
+        timestamp = datetime.now().timestamp()
+        self.update_tc_plot(channel, value, timestamp)
 
     @Slot(str)
     def on_worker_error(self, message: str) -> None:

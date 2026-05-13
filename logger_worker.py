@@ -122,7 +122,7 @@ class DmmLoggerWorker(QObject):
                         temps = tc08_instrument.read_temperatures()
                         for i, config in enumerate(self.tc08_configs):
                             tc08_value = temps.get(config.channel, float("nan"))
-                            self.tc08_reading_updated.emit(i, tc08_value)
+                            self.tc08_reading_updated.emit(config.channel, tc08_value)
                             row.append(f"{tc08_value:.9f}" if not math.isnan(tc08_value) else "")
 
                     writer.writerow(row)
