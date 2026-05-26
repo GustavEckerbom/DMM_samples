@@ -2,9 +2,57 @@
 
 PySide-compatible GUI application for logging measurements from serial DMMs, a Pico USB TC-08 thermocouple logger, and an optional serial-controlled thermal chamber.
 
-## Quick Start
+## Quick Start On Raspberry Pi OS
 
-1. Create and activate a Python virtual environment:
+On Raspberry Pi OS 32-bit, install Qt from apt first. PySide6 is usually not available from pip on 32-bit Raspberry Pi OS, and a normal virtual environment cannot see apt-installed PyQt5 unless it is created with `--system-site-packages`.
+
+1. Install system Qt:
+
+```bash
+sudo apt update
+sudo apt install python3-pyqt5
+```
+
+2. Clone the repo and enter it:
+
+```bash
+cd ~/Desktop
+git clone https://github.com/GustavEckerbom/ThermoPi.git
+cd ThermoPi
+```
+
+If you already created an extra outer `ThermoPi` folder before cloning, enter the inner repo folder instead, for example `cd ~/Desktop/ThermoPi/ThermoPi`.
+
+3. Create and activate a virtual environment that can see system PyQt5:
+
+```bash
+python3 -m venv --system-site-packages venv
+source venv/bin/activate
+```
+
+4. Install Python package dependencies:
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+5. Run the application:
+
+```bash
+python visamples.py
+```
+
+## Quick Start On Windows Or x86_64 Linux
+
+1. Clone the repo and enter it:
+
+```bash
+git clone https://github.com/GustavEckerbom/ThermoPi.git
+cd ThermoPi
+```
+
+2. Create and activate a Python virtual environment:
 
 ```bash
 python -m venv venv
@@ -18,14 +66,15 @@ python3 -m venv venv
 source venv/bin/activate
 ```
 
-2. Install dependencies:
+3. Install dependencies and Qt bindings:
 
 ```bash
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+python -m pip install PySide6
 ```
 
-3. Run the application:
+4. Run the application:
 
 ```bash
 python visamples.py
