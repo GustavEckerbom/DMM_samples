@@ -20,7 +20,7 @@ This implementation uses Get Single mode via PicoSDK:
 
 Requirements:
     - PicoSDK / PicoLog installed
-    - usbtc08.dll available on PATH, or pass dll_path explicitly
+    - usbtc08.dll available on PATH, or pass dll_path explicitly for windows.
     - Python bitness must match the DLL bitness, usually 64-bit Python with 64-bit PicoSDK
 
 Notes:

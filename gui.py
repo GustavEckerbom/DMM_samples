@@ -1,3 +1,5 @@
+"""Main Qt GUI for configuring instruments, logging runs, and live plots."""
+
 import os
 import math
 from datetime import datetime
@@ -18,6 +20,13 @@ from dmm_comm import (
     probe_dmm_port,
 )
 from logger_worker import DmmConfig, DmmLoggerWorker, Tc08Config
+from logger_worker import (
+    ChamberConfig,
+    ChamberProfilePoint,
+    chamber_profile_duration_s,
+    intended_chamber_temperature,
+)
+from thermo_comm import detect_chamber_ports
 
 
 MEASUREMENT_OPTIONS = [
@@ -38,6 +47,10 @@ TC08_TYPES = [
 
 TC08_DISABLED_COLOR = "#8fcaf0"
 TC08_DEFAULT_ENABLED_COLOR = "#1a4b8d"
+CHAMBER_MIN_TEMP_C = -70.0
+CHAMBER_MAX_TEMP_C = 130.0
+CHAMBER_ACTUAL_COLOR = "#b3261e"
+CHAMBER_INTENDED_COLOR = "#2557a7"
 
 
 class CircularBuffer:
@@ -204,7 +217,7 @@ class TC08GraphicsView(QGraphicsView):
 class DmmLoggerWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("DMM Logger")
+        self.setWindowTitle("ThermoPi")
         self.worker_thread: QThread | None = None
         self.worker = None
         self.dmm_panels: list[dict] = []
@@ -277,6 +290,12 @@ class DmmLoggerWindow(QMainWindow):
         self.update_tc08_summary()
         temp_tab_layout.addWidget(self.tc08_tab["widget"])
         self.tab_widget.addTab(temp_tab, "Temp")
+
+        chamber_tab = QWidget()
+        chamber_tab_layout = QVBoxLayout(chamber_tab)
+        self.chamber_tab = self.create_chamber_tab()
+        chamber_tab_layout.addWidget(self.chamber_tab["widget"])
+        self.tab_widget.addTab(chamber_tab, "Thermal Chamber")
 
         plot_tab = QWidget()
         plot_tab_layout = QVBoxLayout(plot_tab)
@@ -399,6 +418,68 @@ class DmmLoggerWindow(QMainWindow):
             "summary": summary_label,
         }
 
+    def create_chamber_tab(self) -> dict:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        enable_checkbox = QCheckBox("Use thermal chamber temperature program")
+        enable_checkbox.stateChanged.connect(self.on_chamber_enabled_changed)
+        layout.addWidget(enable_checkbox)
+
+        port_layout = QHBoxLayout()
+        port_layout.addWidget(QLabel("COM port:"))
+        port_combo = QComboBox()
+        port_layout.addWidget(port_combo)
+        refresh_button = QPushButton("Detect Chamber")
+        refresh_button.clicked.connect(self.populate_chamber_port_items)
+        port_layout.addWidget(refresh_button)
+        port_layout.addStretch()
+        layout.addLayout(port_layout)
+
+        table = QTableWidget(0, 2)
+        table.setHorizontalHeaderLabels(["Temperature C", "Hold min"])
+        table.itemChanged.connect(self.update_chamber_preview)
+        layout.addWidget(table)
+
+        point_layout = QHBoxLayout()
+        add_button = QPushButton("Add Temp")
+        add_button.clicked.connect(self.add_chamber_temperature_step)
+        point_layout.addWidget(add_button)
+        remove_button = QPushButton("Remove Selected")
+        remove_button.clicked.connect(self.remove_selected_chamber_profile_points)
+        point_layout.addWidget(remove_button)
+        point_layout.addStretch()
+        layout.addLayout(point_layout)
+
+        preview_plot = pg.PlotWidget(title="Intended Chamber Temperature Program")
+        preview_plot.setBackground("w")
+        preview_plot.setLabel("left", "Temperature", units="C")
+        preview_plot.setLabel("bottom", "Program time", units="min")
+        preview_plot.showGrid(x=True, y=True, alpha=0.18)
+        layout.addWidget(preview_plot)
+
+        summary = QLabel("Thermal chamber program disabled.")
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        tab = {
+            "widget": widget,
+            "enabled": enable_checkbox,
+            "port": port_combo,
+            "refresh": refresh_button,
+            "table": table,
+            "add": add_button,
+            "remove": remove_button,
+            "preview_plot": preview_plot,
+            "preview_item": None,
+            "summary": summary,
+        }
+        self.chamber_tab = tab
+        self.populate_chamber_port_items()
+        self.add_chamber_temperature_step(20.0, 10.0)
+        self.on_chamber_enabled_changed()
+        return tab
+
     def create_plot_tab(self) -> dict:
         """Create a tab with PyQtGraph plots for temperature and DMM data."""
         widget = QWidget()
@@ -416,8 +497,8 @@ class DmmLoggerWindow(QMainWindow):
         control_layout.addStretch()
         layout.addLayout(control_layout)
 
-        # Create two plot widgets side-by-side
-        plot_container = QHBoxLayout()
+        # Create separate plot widgets for temperature, DMM, and chamber data.
+        plot_container = QGridLayout()
         
         # Temperature plot
         tc_plot = pg.PlotWidget(
@@ -429,7 +510,7 @@ class DmmLoggerWindow(QMainWindow):
         tc_plot.setLabel("bottom", "Time")
         tc_plot.addLegend()
         tc_plot.showGrid(x=True, y=True, alpha=0.18)
-        plot_container.addWidget(tc_plot)
+        plot_container.addWidget(tc_plot, 0, 0)
         
         # DMM plot
         dmm_plot = pg.PlotWidget(
@@ -441,7 +522,18 @@ class DmmLoggerWindow(QMainWindow):
         dmm_plot.setLabel("bottom", "Time")
         dmm_plot.addLegend()
         dmm_plot.showGrid(x=True, y=True, alpha=0.18)
-        plot_container.addWidget(dmm_plot)
+        plot_container.addWidget(dmm_plot, 0, 1)
+
+        chamber_plot = pg.PlotWidget(
+            title="Thermal Chamber",
+            axisItems={"bottom": pg.DateAxisItem(orientation="bottom")},
+        )
+        chamber_plot.setBackground("w")
+        chamber_plot.setLabel("left", "Temperature", units="C")
+        chamber_plot.setLabel("bottom", "Time")
+        chamber_plot.addLegend()
+        chamber_plot.showGrid(x=True, y=True, alpha=0.18)
+        plot_container.addWidget(chamber_plot, 1, 0, 1, 2)
         
         layout.addLayout(plot_container)
         
@@ -452,9 +544,163 @@ class DmmLoggerWindow(QMainWindow):
             "sample_spinbox": sample_spinbox,
             "tc_buffers": {},  # {channel: CircularBuffer}
             "dmm_buffers": {},  # {dmm_index: CircularBuffer}
+            "chamber_actual_buffer": CircularBuffer(sample_spinbox.value()),
+            "chamber_intended_buffer": CircularBuffer(sample_spinbox.value()),
             "tc_plot_items": {},  # {channel: PlotDataItem}
             "dmm_plot_items": {},  # {dmm_index: PlotDataItem}
+            "chamber_plot": chamber_plot,
+            "chamber_actual_item": None,
+            "chamber_intended_item": None,
         }
+
+    def populate_chamber_port_items(self) -> None:
+        if not hasattr(self, "chamber_tab"):
+            return
+
+        current = self.chamber_tab["port"].currentData()
+        self.chamber_tab["port"].clear()
+        detected_chambers = detect_chamber_ports(timeout_s=1.0)
+        for chamber in detected_chambers:
+            display = f"{chamber.port} - {chamber.response}"
+            self.chamber_tab["port"].addItem(display, chamber.port)
+
+        if not detected_chambers:
+            self.chamber_tab["port"].addItem("No thermal chamber detected", None)
+            if hasattr(self, "status_area"):
+                self.append_status("No thermal chamber detected.")
+            return
+
+        if hasattr(self, "status_area"):
+            self.append_status(f"Detected {len(detected_chambers)} thermal chamber port(s).")
+
+        if current:
+            index = self.chamber_tab["port"].findData(current)
+            if index >= 0:
+                self.chamber_tab["port"].setCurrentIndex(index)
+
+    def add_chamber_temperature_step(self, temperature_c: float | bool = 20.0, hold_min: float = 10.0) -> None:
+        if isinstance(temperature_c, bool):
+            rows = self.chamber_tab["table"].rowCount()
+            temperature_c = 20.0
+            if rows > 0:
+                last_item = self.chamber_tab["table"].item(rows - 1, 0)
+                try:
+                    temperature_c = float(last_item.text()) if last_item is not None else 20.0
+                except ValueError:
+                    temperature_c = 20.0
+
+        table = self.chamber_tab["table"]
+        row = table.rowCount()
+        table.blockSignals(True)
+        table.insertRow(row)
+        table.setItem(row, 0, QTableWidgetItem(f"{float(temperature_c):.6g}"))
+        table.setItem(row, 1, QTableWidgetItem(f"{float(hold_min):.6g}"))
+        table.blockSignals(False)
+        self.update_chamber_preview()
+
+    def remove_selected_chamber_profile_points(self) -> None:
+        table = self.chamber_tab["table"]
+        rows = sorted({index.row() for index in table.selectedIndexes()}, reverse=True)
+        table.blockSignals(True)
+        for row in rows:
+            table.removeRow(row)
+        table.blockSignals(False)
+        self.update_chamber_preview()
+
+    def on_chamber_enabled_changed(self, *args) -> None:
+        if not hasattr(self, "chamber_tab"):
+            return
+
+        enabled = self.chamber_tab["enabled"].isChecked()
+        for key in ("port", "refresh", "table", "add", "remove", "preview_plot"):
+            self.chamber_tab[key].setEnabled(enabled)
+        self.update_chamber_preview()
+
+    def collect_chamber_profile(self, show_errors: bool = True) -> list[ChamberProfilePoint] | None:
+        table = self.chamber_tab["table"]
+        points: list[ChamberProfilePoint] = []
+        errors: list[str] = []
+
+        for row in range(table.rowCount()):
+            temp_item = table.item(row, 0)
+            hold_item = table.item(row, 1)
+            temp_text = temp_item.text().strip() if temp_item is not None else ""
+            hold_text = hold_item.text().strip() if hold_item is not None else ""
+
+            try:
+                temperature_c = float(temp_text)
+            except ValueError:
+                errors.append(f"Row {row + 1}: temperature must be numeric.")
+                continue
+
+            try:
+                hold_min = float(hold_text)
+            except ValueError:
+                errors.append(f"Row {row + 1}: hold duration must be numeric.")
+                continue
+
+            if not (CHAMBER_MIN_TEMP_C <= temperature_c <= CHAMBER_MAX_TEMP_C):
+                errors.append(
+                    f"Row {row + 1}: temperature must be between "
+                    f"{CHAMBER_MIN_TEMP_C:.0f} and {CHAMBER_MAX_TEMP_C:.0f} C."
+                )
+            if hold_min < 0:
+                errors.append(f"Row {row + 1}: hold duration must be zero or greater.")
+            points.append(ChamberProfilePoint(temperature_c=temperature_c, hold_s=hold_min * 60.0))
+
+        if not points:
+            errors.append("Add at least one thermal chamber temperature step.")
+
+        if errors:
+            if show_errors:
+                QMessageBox.warning(self, "Thermal Chamber Program", "\n".join(errors))
+            return None
+
+        return points
+
+    def update_chamber_preview(self, *args) -> None:
+        if not hasattr(self, "chamber_tab"):
+            return
+
+        enabled = self.chamber_tab["enabled"].isChecked()
+        points = self.collect_chamber_profile(show_errors=False)
+        plot = self.chamber_tab["preview_plot"]
+        plot.clear()
+        self.chamber_tab["preview_item"] = None
+
+        if not enabled:
+            self.chamber_tab["summary"].setText("Thermal chamber program disabled.")
+            return
+        if not points:
+            self.chamber_tab["summary"].setText("Enter valid temperature steps to preview the intended program.")
+            return
+
+        end_s = self.chamber_profile_preview_end_s(points)
+        step_s = max(5.0, min(60.0, end_s / 240.0 if end_s > 0 else 5.0))
+        sample_count = int(end_s / step_s) + 1
+        elapsed_s = [min(index * step_s, end_s) for index in range(sample_count + 1)]
+        if end_s not in elapsed_s:
+            elapsed_s.append(end_s)
+
+        elapsed_min = [value / 60.0 for value in elapsed_s]
+        intended = [intended_chamber_temperature(points, value) for value in elapsed_s]
+        self.chamber_tab["preview_item"] = plot.plot(
+            elapsed_min,
+            intended,
+            pen=pg.mkPen(CHAMBER_INTENDED_COLOR, width=2),
+            connect="all",
+        )
+        plot.setYRange(CHAMBER_MIN_TEMP_C - 5, CHAMBER_MAX_TEMP_C + 5, padding=0)
+        self.chamber_tab["summary"].setText(
+            f"{len(points)} temperature step(s), {chamber_profile_duration_s(points) / 60.0:.3g} min programmed hold/ramp time."
+        )
+
+    def chamber_profile_preview_end_s(self, points: list[ChamberProfilePoint]) -> float:
+        if not points:
+            return 0.0
+
+        end_s = chamber_profile_duration_s(points)
+        return max(end_s + 60.0, 60.0)
 
     def open_tc08_channel_dialog(self, index: int) -> None:
         config = self.tc08_tab["configs"][index]
@@ -555,6 +801,8 @@ class DmmLoggerWindow(QMainWindow):
             buffer.set_max_size(new_count)
         for buffer in self.plot_tab["dmm_buffers"].values():
             buffer.set_max_size(new_count)
+        self.plot_tab["chamber_actual_buffer"].set_max_size(new_count)
+        self.plot_tab["chamber_intended_buffer"].set_max_size(new_count)
         self.rescale_tc_plot_y_axis()
 
     def rescale_tc_plot_y_axis(self) -> None:
@@ -628,6 +876,39 @@ class DmmLoggerWindow(QMainWindow):
             self.plot_tab["dmm_plot"].setYRange(min_val - padding, max_val + padding)
             
             self.plot_tab["dmm_plot_items"][dmm_index].setData(timestamps, values, connect="all")
+
+    def update_chamber_plot(self, actual_temp: float, intended_temp: float, timestamp: float) -> None:
+        if self.plot_tab["chamber_actual_item"] is None:
+            self.plot_tab["chamber_actual_item"] = self.plot_tab["chamber_plot"].plot(
+                name="Actual",
+                pen=pg.mkPen(CHAMBER_ACTUAL_COLOR, width=2),
+                connect="all",
+            )
+        if self.plot_tab["chamber_intended_item"] is None:
+            self.plot_tab["chamber_intended_item"] = self.plot_tab["chamber_plot"].plot(
+                name="Intended",
+                pen=pg.mkPen(CHAMBER_INTENDED_COLOR, width=2),
+                connect="all",
+            )
+
+        self.plot_tab["chamber_actual_buffer"].append(actual_temp, timestamp)
+        self.plot_tab["chamber_intended_buffer"].append(intended_temp, timestamp)
+
+        actual_timestamps, actual_values = self.plot_tab["chamber_actual_buffer"].get_data()
+        intended_timestamps, intended_values = self.plot_tab["chamber_intended_buffer"].get_data()
+
+        if actual_timestamps:
+            self.plot_tab["chamber_actual_item"].setData(actual_timestamps, actual_values, connect="all")
+        if intended_timestamps:
+            self.plot_tab["chamber_intended_item"].setData(intended_timestamps, intended_values, connect="all")
+
+        values = [
+            value
+            for value in actual_values + intended_values
+            if not math.isnan(value)
+        ]
+        if values:
+            self.plot_tab["chamber_plot"].setYRange(min(values) - 5, max(values) + 5, padding=0)
 
     def format_range_display(self, value: str, measurement_type: str) -> str:
         """Format range value for display with appropriate units."""
@@ -750,6 +1031,11 @@ class DmmLoggerWindow(QMainWindow):
         self.plot_tab["dmm_plot_items"].clear()
         self.plot_tab["tc_plot"].clear()
         self.plot_tab["dmm_plot"].clear()
+        self.plot_tab["chamber_actual_buffer"].clear()
+        self.plot_tab["chamber_intended_buffer"].clear()
+        self.plot_tab["chamber_plot"].clear()
+        self.plot_tab["chamber_actual_item"] = None
+        self.plot_tab["chamber_intended_item"] = None
 
         configs = []
         tc08_configs = []
@@ -788,11 +1074,28 @@ class DmmLoggerWindow(QMainWindow):
                     )
                 )
 
-        if not configs and not tc08_configs:
+        chamber_config = None
+        if self.chamber_tab["enabled"].isChecked():
+            chamber_port = self.chamber_tab["port"].currentData()
+            if not chamber_port:
+                QMessageBox.warning(
+                    self,
+                    "Start Logging",
+                    "Please detect and select a thermal chamber COM port.",
+                )
+                return
+
+            chamber_profile = self.collect_chamber_profile(show_errors=True)
+            if chamber_profile is None:
+                return
+
+            chamber_config = ChamberConfig(port=chamber_port, profile=chamber_profile)
+
+        if not configs and not tc08_configs and chamber_config is None:
             QMessageBox.warning(
                 self,
                 "Start Logging",
-                "Select at least one DMM or enable at least one TC-08 channel.",
+                "Select at least one DMM, enable at least one TC-08 channel, or enable a thermal chamber program.",
             )
             return
 
@@ -816,6 +1119,7 @@ class DmmLoggerWindow(QMainWindow):
             tc08_configs=tc08_configs,
             csv_path=csv_path,
             sample_period_s=sample_period,
+            chamber_config=chamber_config,
         )
 
         self.worker_thread = QThread()
@@ -825,6 +1129,7 @@ class DmmLoggerWindow(QMainWindow):
         self.worker.status_updated.connect(self.append_status)
         self.worker.reading_updated.connect(self.on_reading_updated)
         self.worker.tc08_reading_updated.connect(self.on_tc08_reading_updated)
+        self.worker.chamber_reading_updated.connect(self.on_chamber_reading_updated)
         self.worker.error_occurred.connect(self.on_worker_error)
         self.worker.finished.connect(self.worker_thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
@@ -835,6 +1140,7 @@ class DmmLoggerWindow(QMainWindow):
         self.detect_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.dmm_count_combo.setEnabled(False)
+        self.chamber_tab["widget"].setEnabled(False)
         self.append_status(f"Started logging to {csv_path}")
 
     @Slot()
@@ -876,6 +1182,12 @@ class DmmLoggerWindow(QMainWindow):
         timestamp = datetime.now().timestamp()
         self.update_tc_plot(channel, value, timestamp)
 
+    @Slot(float, float)
+    def on_chamber_reading_updated(self, actual_temp: float, intended_temp: float) -> None:
+        self.flash_recording_indicator()
+        timestamp = datetime.now().timestamp()
+        self.update_chamber_plot(actual_temp, intended_temp, timestamp)
+
     @Slot(str)
     def on_worker_error(self, message: str) -> None:
         self.append_status(f"Error: {message}")
@@ -889,6 +1201,7 @@ class DmmLoggerWindow(QMainWindow):
         self.detect_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.dmm_count_combo.setEnabled(True)
+        self.chamber_tab["widget"].setEnabled(True)
         self.append_status("Logging stopped.")
 
     def on_tc08_enabled_changed(self) -> None:

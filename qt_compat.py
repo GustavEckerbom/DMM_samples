@@ -12,6 +12,7 @@ try:
         QComboBox,
         QDialog,
         QDialogButtonBox,
+        QDoubleSpinBox,
         QFrame,
         QGroupBox,
         QGridLayout,
@@ -32,6 +33,8 @@ try:
         QGraphicsRectItem,
         QGraphicsItem,
         QSpinBox,
+        QTableWidget,
+        QTableWidgetItem,
     )
     QtBindings = "PySide6"
 
@@ -46,6 +49,7 @@ except ImportError:
             QComboBox,
             QDialog,
             QDialogButtonBox,
+            QDoubleSpinBox,
             QFrame,
             QGroupBox,
             QGridLayout,
@@ -66,6 +70,8 @@ except ImportError:
             QGraphicsRectItem,
             QGraphicsItem,
             QSpinBox,
+            QTableWidget,
+            QTableWidgetItem,
         )
         QtBindings = "PySide2"
 
@@ -80,6 +86,7 @@ except ImportError:
                 QComboBox,
                 QDialog,
                 QDialogButtonBox,
+                QDoubleSpinBox,
                 QFrame,
                 QGroupBox,
                 QGridLayout,
@@ -100,6 +107,8 @@ except ImportError:
                 QGraphicsRectItem,
                 QGraphicsItem,
                 QSpinBox,
+                QTableWidget,
+                QTableWidgetItem,
             )
             QtBindings = "PyQt5"
 
@@ -129,6 +138,7 @@ __all__ = [
     "QComboBox",
     "QDialog",
     "QDialogButtonBox",
+    "QDoubleSpinBox",
     "QFrame",
     "QGroupBox",
     "QGridLayout",
@@ -149,6 +159,8 @@ __all__ = [
     "QGraphicsRectItem",
     "QGraphicsItem",
     "QSpinBox",
+    "QTableWidget",
+    "QTableWidgetItem",
     "QObject",
     "Signal",
     "QMouseEvent",

@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project generated data and local hardware/runtime files
+dmm_log_*.csv
+temperature_log.txt
+*.log
+*.tmp
+
+# Local vendor driver binaries copied next to the app
+*.dll
+*.dylib
