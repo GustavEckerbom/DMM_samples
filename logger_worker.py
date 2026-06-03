@@ -256,6 +256,12 @@ class DmmLoggerWorker(QObject):
                     if self.chamber_config is not None
                     else []
                 )
+                chamber_program_duration_s = (
+                    chamber_profile_duration_s(self.chamber_config.profile)
+                    if self.chamber_config is not None
+                    else 0.0
+                )
+                chamber_program_turned_off = False
 
                 while not self._stop_requested:
                     loop_start = time.time()
@@ -291,6 +297,15 @@ class DmmLoggerWorker(QObject):
 
                         set_temp = chamber_command_temperature(self.chamber_config.profile, elapsed_s)
                         intended_temp = intended_chamber_temperature(self.chamber_config.profile, elapsed_s)
+                        if (
+                            not chamber_program_turned_off
+                            and elapsed_s >= chamber_program_duration_s
+                        ):
+                            chamber_instrument.turn_off()
+                            chamber_program_turned_off = True
+                            self.status_updated.emit(
+                                "Thermal chamber program complete; chamber turned off"
+                            )
                         actual_temp = chamber_instrument.read_temperature()
                         self.chamber_reading_updated.emit(actual_temp, intended_temp)
                         row.append(f"{actual_temp:.9f}" if not math.isnan(actual_temp) else "")

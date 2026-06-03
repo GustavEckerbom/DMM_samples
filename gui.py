@@ -2,6 +2,7 @@
 
 import os
 import math
+import time
 from datetime import datetime
 
 from qt_compat import *
@@ -23,10 +24,11 @@ from logger_worker import DmmConfig, DmmLoggerWorker, Tc08Config
 from logger_worker import (
     ChamberConfig,
     ChamberProfilePoint,
+    chamber_profile_command_times,
     chamber_profile_duration_s,
     intended_chamber_temperature,
 )
-from thermo_comm import detect_chamber_ports
+from thermo_comm import ThermalChamberInstrument, detect_chamber_ports
 
 
 MEASUREMENT_OPTIONS = [
@@ -51,6 +53,101 @@ CHAMBER_MIN_TEMP_C = -70.0
 CHAMBER_MAX_TEMP_C = 130.0
 CHAMBER_ACTUAL_COLOR = "#b3261e"
 CHAMBER_INTENDED_COLOR = "#2557a7"
+
+
+class ChamberControlWorker(QObject):
+    status_updated = Signal(str)
+    reading_updated = Signal(float, float)
+    finished = Signal()
+    error_occurred = Signal(str)
+
+    def __init__(
+        self,
+        port: str,
+        profile: list[ChamberProfilePoint] | None = None,
+        sample_period_s: float = 1.0,
+        turn_off_only: bool = False,
+    ) -> None:
+        super().__init__()
+        self.port = port
+        self.profile = profile or []
+        self.sample_period_s = sample_period_s
+        self.turn_off_only = turn_off_only
+        self._stop_requested = False
+        self._turn_off_requested = False
+
+    @Slot()
+    def stop(self) -> None:
+        self._stop_requested = True
+        self._turn_off_requested = True
+        self.status_updated.emit("Thermal chamber stop requested")
+
+    @Slot()
+    def run(self) -> None:
+        chamber = None
+        try:
+            chamber = ThermalChamberInstrument(self.port)
+            chamber.open()
+
+            if self.turn_off_only:
+                chamber.turn_off()
+                self.status_updated.emit("Thermal chamber turned off")
+                return
+
+            if not self.profile:
+                raise ValueError("Add at least one thermal chamber temperature step.")
+
+            first_point = self.profile[0]
+            chamber.set_temperature(first_point.temperature_c)
+            self.status_updated.emit(
+                f"Thermal chamber setpoint: {first_point.temperature_c:.1f} C"
+            )
+
+            command_times = chamber_profile_command_times(self.profile)
+            next_command_index = 1
+            duration_s = chamber_profile_duration_s(self.profile)
+            t0 = time.time()
+
+            while not self._stop_requested:
+                loop_start = time.time()
+                elapsed_s = loop_start - t0
+
+                while (
+                    next_command_index < len(command_times)
+                    and elapsed_s >= command_times[next_command_index][0]
+                ):
+                    _, target_c = command_times[next_command_index]
+                    chamber.set_temperature(target_c)
+                    self.status_updated.emit(f"Thermal chamber setpoint: {target_c:.1f} C")
+                    next_command_index += 1
+
+                intended_temp = intended_chamber_temperature(self.profile, elapsed_s)
+                actual_temp = chamber.read_temperature()
+                self.reading_updated.emit(actual_temp, intended_temp)
+
+                if elapsed_s >= duration_s:
+                    chamber.turn_off()
+                    self.status_updated.emit(
+                        "Thermal chamber program complete; chamber turned off"
+                    )
+                    return
+
+                sleep_until = loop_start + self.sample_period_s
+                while not self._stop_requested and time.time() < sleep_until:
+                    time.sleep(min(0.1, sleep_until - time.time()))
+
+            self._turn_off_requested = True
+        except Exception as exc:
+            self.error_occurred.emit(str(exc))
+        finally:
+            if chamber is not None:
+                if self._turn_off_requested and not self.turn_off_only:
+                    try:
+                        chamber.turn_off()
+                    except Exception as exc:
+                        self.error_occurred.emit(str(exc))
+                chamber.close()
+            self.finished.emit()
 
 
 class CircularBuffer:
@@ -220,6 +317,8 @@ class DmmLoggerWindow(QMainWindow):
         self.setWindowTitle("ThermoPi")
         self.worker_thread: QThread | None = None
         self.worker = None
+        self.chamber_thread: QThread | None = None
+        self.chamber_worker = None
         self.dmm_panels: list[dict] = []
         self.detected_dmms: list[DmmProbeResult] = []
         self.init_ui()
@@ -233,10 +332,6 @@ class DmmLoggerWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
 
         controls_layout = QHBoxLayout()
-        self.detect_button = QPushButton("Detect DMMs")
-        self.detect_button.clicked.connect(self.on_detect_dmm_clicked)
-        controls_layout.addWidget(self.detect_button)
-
         self.start_button = QPushButton("Start Logging")
         self.start_button.clicked.connect(self.on_start_logging)
         controls_layout.addWidget(self.start_button)
@@ -262,9 +357,18 @@ class DmmLoggerWindow(QMainWindow):
 
         self.tab_widget = QTabWidget()
 
+        chamber_tab = QWidget()
+        chamber_tab_layout = QVBoxLayout(chamber_tab)
+        self.chamber_tab = self.create_chamber_tab()
+        chamber_tab_layout.addWidget(self.chamber_tab["widget"])
+        self.tab_widget.addTab(chamber_tab, "Thermal Chamber")
+
         dmm_tab = QWidget()
         dmm_tab_layout = QVBoxLayout(dmm_tab)
         dmm_controls_layout = QHBoxLayout()
+        self.detect_button = QPushButton("Detect DMMs")
+        self.detect_button.clicked.connect(self.on_detect_dmm_clicked)
+        dmm_controls_layout.addWidget(self.detect_button)
         self.dmm_count_combo = QComboBox()
         self.dmm_count_combo.addItems(["0", "1", "2", "3", "4"])
         self.dmm_count_combo.setCurrentText("0")
@@ -290,12 +394,6 @@ class DmmLoggerWindow(QMainWindow):
         self.update_tc08_summary()
         temp_tab_layout.addWidget(self.tc08_tab["widget"])
         self.tab_widget.addTab(temp_tab, "Temp")
-
-        chamber_tab = QWidget()
-        chamber_tab_layout = QVBoxLayout(chamber_tab)
-        self.chamber_tab = self.create_chamber_tab()
-        chamber_tab_layout.addWidget(self.chamber_tab["widget"])
-        self.tab_widget.addTab(chamber_tab, "Thermal Chamber")
 
         plot_tab = QWidget()
         plot_tab_layout = QVBoxLayout(plot_tab)
@@ -422,7 +520,7 @@ class DmmLoggerWindow(QMainWindow):
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
-        enable_checkbox = QCheckBox("Use thermal chamber temperature program")
+        enable_checkbox = QCheckBox("Include chamber program in logging")
         enable_checkbox.stateChanged.connect(self.on_chamber_enabled_changed)
         layout.addWidget(enable_checkbox)
 
@@ -433,6 +531,12 @@ class DmmLoggerWindow(QMainWindow):
         refresh_button = QPushButton("Detect Chamber")
         refresh_button.clicked.connect(self.populate_chamber_port_items)
         port_layout.addWidget(refresh_button)
+        turn_on_button = QPushButton("Turn On")
+        turn_on_button.clicked.connect(self.on_chamber_turn_on_clicked)
+        port_layout.addWidget(turn_on_button)
+        turn_off_button = QPushButton("Turn Off")
+        turn_off_button.clicked.connect(self.on_chamber_turn_off_clicked)
+        port_layout.addWidget(turn_off_button)
         port_layout.addStretch()
         layout.addLayout(port_layout)
 
@@ -467,6 +571,8 @@ class DmmLoggerWindow(QMainWindow):
             "enabled": enable_checkbox,
             "port": port_combo,
             "refresh": refresh_button,
+            "turn_on": turn_on_button,
+            "turn_off": turn_off_button,
             "table": table,
             "add": add_button,
             "remove": remove_button,
@@ -475,7 +581,7 @@ class DmmLoggerWindow(QMainWindow):
             "summary": summary,
         }
         self.chamber_tab = tab
-        self.populate_chamber_port_items()
+        port_combo.addItem("Click Detect Chamber", None)
         self.add_chamber_temperature_step(20.0, 10.0)
         self.on_chamber_enabled_changed()
         return tab
@@ -578,6 +684,114 @@ class DmmLoggerWindow(QMainWindow):
             if index >= 0:
                 self.chamber_tab["port"].setCurrentIndex(index)
 
+    def selected_chamber_port(self, title: str) -> str | None:
+        chamber_port = self.chamber_tab["port"].currentData()
+        if not chamber_port:
+            QMessageBox.warning(
+                self,
+                title,
+                "Please detect and select a thermal chamber COM port.",
+            )
+            return None
+        return chamber_port
+
+    def chamber_sample_period_s(self) -> float:
+        try:
+            sample_period = float(self.sample_period_edit.text().strip())
+            if sample_period > 0:
+                return sample_period
+        except ValueError:
+            pass
+        return 1.0
+
+    def set_chamber_controls_running(self, running: bool) -> None:
+        self.chamber_tab["turn_on"].setEnabled(not running)
+        self.chamber_tab["turn_off"].setEnabled(True)
+        self.chamber_tab["port"].setEnabled(not running)
+        self.chamber_tab["refresh"].setEnabled(not running)
+        for key in ("enabled", "table", "add", "remove"):
+            self.chamber_tab[key].setEnabled(not running)
+        self.chamber_tab["preview_plot"].setEnabled(not running)
+
+    @Slot()
+    def on_chamber_turn_on_clicked(self) -> None:
+        if self.chamber_thread is not None:
+            return
+
+        chamber_port = self.selected_chamber_port("Turn On Thermal Chamber")
+        if chamber_port is None:
+            return
+
+        chamber_profile = self.collect_chamber_profile(show_errors=True)
+        if chamber_profile is None:
+            return
+
+        self.start_chamber_control_worker(
+            chamber_port,
+            profile=chamber_profile,
+            turn_off_only=False,
+        )
+
+    @Slot()
+    def on_chamber_turn_off_clicked(self) -> None:
+        if self.chamber_worker is not None:
+            self.chamber_worker.stop()
+            self.chamber_tab["turn_off"].setEnabled(False)
+            return
+
+        chamber_port = self.selected_chamber_port("Turn Off Thermal Chamber")
+        if chamber_port is None:
+            return
+
+        self.start_chamber_control_worker(
+            chamber_port,
+            profile=None,
+            turn_off_only=True,
+        )
+
+    def start_chamber_control_worker(
+        self,
+        chamber_port: str,
+        profile: list[ChamberProfilePoint] | None,
+        turn_off_only: bool,
+    ) -> None:
+        self.chamber_worker = ChamberControlWorker(
+            port=chamber_port,
+            profile=profile,
+            sample_period_s=self.chamber_sample_period_s(),
+            turn_off_only=turn_off_only,
+        )
+        self.chamber_thread = QThread()
+        self.chamber_worker.moveToThread(self.chamber_thread)
+        self.chamber_thread.started.connect(self.chamber_worker.run)
+        self.chamber_thread.finished.connect(self.on_chamber_control_finished)
+        self.chamber_worker.status_updated.connect(self.append_status)
+        self.chamber_worker.reading_updated.connect(self.on_chamber_reading_updated)
+        self.chamber_worker.error_occurred.connect(self.on_chamber_control_error)
+        self.chamber_worker.finished.connect(self.chamber_thread.quit)
+        self.chamber_worker.finished.connect(self.chamber_worker.deleteLater)
+
+        self.set_chamber_controls_running(True)
+        self.chamber_thread.start()
+        self.append_status(
+            "Turning thermal chamber off"
+            if turn_off_only
+            else "Thermal chamber program started"
+        )
+
+    @Slot(str)
+    def on_chamber_control_error(self, message: str) -> None:
+        self.append_status(f"Thermal chamber error: {message}")
+        QMessageBox.critical(self, "Thermal Chamber", message)
+
+    @Slot()
+    def on_chamber_control_finished(self) -> None:
+        self.chamber_thread = None
+        self.chamber_worker = None
+        self.set_chamber_controls_running(False)
+        self.on_chamber_enabled_changed()
+        self.append_status("Thermal chamber control stopped.")
+
     def add_chamber_temperature_step(self, temperature_c: float | bool = 20.0, hold_min: float = 10.0) -> None:
         if isinstance(temperature_c, bool):
             rows = self.chamber_tab["table"].rowCount()
@@ -611,9 +825,6 @@ class DmmLoggerWindow(QMainWindow):
         if not hasattr(self, "chamber_tab"):
             return
 
-        enabled = self.chamber_tab["enabled"].isChecked()
-        for key in ("port", "refresh", "table", "add", "remove", "preview_plot"):
-            self.chamber_tab[key].setEnabled(enabled)
         self.update_chamber_preview()
 
     def collect_chamber_profile(self, show_errors: bool = True) -> list[ChamberProfilePoint] | None:
@@ -662,15 +873,11 @@ class DmmLoggerWindow(QMainWindow):
         if not hasattr(self, "chamber_tab"):
             return
 
-        enabled = self.chamber_tab["enabled"].isChecked()
         points = self.collect_chamber_profile(show_errors=False)
         plot = self.chamber_tab["preview_plot"]
         plot.clear()
         self.chamber_tab["preview_item"] = None
 
-        if not enabled:
-            self.chamber_tab["summary"].setText("Thermal chamber program disabled.")
-            return
         if not points:
             self.chamber_tab["summary"].setText("Enter valid temperature steps to preview the intended program.")
             return
@@ -691,8 +898,13 @@ class DmmLoggerWindow(QMainWindow):
             connect="all",
         )
         plot.setYRange(CHAMBER_MIN_TEMP_C - 5, CHAMBER_MAX_TEMP_C + 5, padding=0)
+        logging_state = (
+            "included in logging"
+            if self.chamber_tab["enabled"].isChecked()
+            else "manual control only"
+        )
         self.chamber_tab["summary"].setText(
-            f"{len(points)} temperature step(s), {chamber_profile_duration_s(points) / 60.0:.3g} min programmed hold/ramp time."
+            f"{len(points)} temperature step(s), {chamber_profile_duration_s(points) / 60.0:.3g} min programmed hold/ramp time; {logging_state}."
         )
 
     def chamber_profile_preview_end_s(self, points: list[ChamberProfilePoint]) -> float:
@@ -1076,6 +1288,14 @@ class DmmLoggerWindow(QMainWindow):
 
         chamber_config = None
         if self.chamber_tab["enabled"].isChecked():
+            if self.chamber_thread is not None:
+                QMessageBox.warning(
+                    self,
+                    "Start Logging",
+                    "Stop the standalone thermal chamber program before logging the chamber.",
+                )
+                return
+
             chamber_port = self.chamber_tab["port"].currentData()
             if not chamber_port:
                 QMessageBox.warning(
@@ -1140,7 +1360,8 @@ class DmmLoggerWindow(QMainWindow):
         self.detect_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.dmm_count_combo.setEnabled(False)
-        self.chamber_tab["widget"].setEnabled(False)
+        if chamber_config is not None:
+            self.chamber_tab["widget"].setEnabled(False)
         self.append_status(f"Started logging to {csv_path}")
 
     @Slot()

@@ -21,7 +21,6 @@ git clone https://github.com/GustavEckerbom/ThermoPi.git
 cd ThermoPi
 ```
 
-If you already created an extra outer `ThermoPi` folder before cloning, enter the inner repo folder instead, for example `cd ~/Desktop/ThermoPi/ThermoPi`.
 
 3. Create and activate a virtual environment that can see system PyQt5:
 
